@@ -1,0 +1,749 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>Suminagashi Signature</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #efe9dc; }
+  canvas#ink { display: block; position: fixed; inset: 0; cursor: crosshair; }
+  .ui { position: fixed; left: 0; right: 0; text-align: center; pointer-events: none;
+        font-family: "Hoefler Text", Georgia, "Times New Roman", serif; color: #2b2a26; }
+  #title  { top: 26px; letter-spacing: .22em; font-size: 12px; text-transform: uppercase; opacity: .55; }
+  #sub    { top: 46px; font-size: 12px; font-style: italic; opacity: .4; }
+  #hint   { top: 45%; font-style: italic; font-size: 24px; opacity: .45; transition: opacity 1s; }
+  #hint.hidden { opacity: 0; }
+  #name   { bottom: 70px; font-style: italic; font-size: 34px; min-height: 44px; opacity: .85;
+            white-space: pre; overflow: hidden; }
+  #controls { position: fixed; bottom: 24px; left: 0; right: 0; text-align: center;
+              font-family: Georgia, serif; }
+  #controls button { pointer-events: auto; background: none; border: none;
+              border-bottom: 1px solid rgba(43,42,38,.35); color: #2b2a26; opacity: .5;
+              font: inherit; font-size: 12px; letter-spacing: .14em; text-transform: uppercase;
+              margin: 0 16px; padding: 2px; cursor: pointer; }
+  #controls button:hover { opacity: .95; }
+  #kb { position: fixed; left: -9999px; top: 0; opacity: 0; }
+  #fallback { display: none; position: fixed; inset: 0; place-items: center;
+              font-family: Georgia, serif; font-style: italic; color: #2b2a26; }
+</style>
+</head>
+<body>
+<canvas id="ink"></canvas>
+<div class="ui" id="title">Suminagashi Signature</div>
+<div class="ui" id="sub">each keystroke drops ink &middot; drag to stir &middot; enter for a flourish</div>
+<div class="ui" id="hint">type your name</div>
+<div class="ui" id="name"></div>
+<div id="controls">
+  <button id="clearBtn">Clear</button>
+  <button id="saveBtn">Save</button>
+</div>
+<input id="kb" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">
+<div id="fallback">this piece needs WebGL2</div>
+
+<script>
+'use strict';
+
+// A real fluid simulation (Stam's stable fluids on the GPU): pigment is dye
+// advected by a velocity field. Each keystroke injects dye with a gentle
+// outward puff, so the ink visibly blooms and feathers into the water.
+// Rendering uses Beer-Lambert absorption over paper, so overlapping washes
+// darken the way layered watercolor does.
+
+const PAPER_RGB = [0.937, 0.913, 0.863]; // #efe9dc
+const canvas = document.getElementById('ink');
+const gl = canvas.getContext('webgl2', { alpha: false, preserveDrawingBuffer: true });
+
+if (!gl || !gl.getExtension('EXT_color_buffer_float')) {
+  document.getElementById('fallback').style.display = 'grid';
+  throw new Error('WebGL2 float buffers unavailable');
+}
+gl.getExtension('OES_texture_float_linear');
+
+// ---------- GL plumbing ----------
+
+function compile(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS))
+    console.error(gl.getShaderInfoLog(s), src);
+  return s;
+}
+
+function program(fragSrc) {
+  const p = gl.createProgram();
+  gl.attachShader(p, baseVertex);
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fragSrc));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS))
+    console.error(gl.getProgramInfoLog(p));
+  const uniforms = {};
+  const count = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+  for (let i = 0; i < count; i++) {
+    const name = gl.getActiveUniform(p, i).name;
+    uniforms[name] = gl.getUniformLocation(p, name);
+  }
+  return { p, u: uniforms };
+}
+
+const VERT = `#version 300 es
+precision highp float;
+in vec2 aPosition;
+out vec2 vUv, vL, vR, vT, vB;
+uniform vec2 texelSize;
+void main() {
+  vUv = aPosition * 0.5 + 0.5;
+  vL = vUv - vec2(texelSize.x, 0.0);
+  vR = vUv + vec2(texelSize.x, 0.0);
+  vT = vUv + vec2(0.0, texelSize.y);
+  vB = vUv - vec2(0.0, texelSize.y);
+  gl_Position = vec4(aPosition, 0.0, 1.0);
+}`;
+const baseVertex = compile(gl.VERTEX_SHADER, VERT);
+
+const HEADER = `#version 300 es
+precision highp float;
+precision highp sampler2D;
+in vec2 vUv, vL, vR, vT, vB;
+out vec4 fragColor;
+`;
+
+const splatProg = program(HEADER + `
+uniform sampler2D uTarget;
+uniform float aspectRatio;
+uniform vec3 color;
+uniform vec2 point;
+uniform float radius;
+uniform float uMode; // 0: add color, 1: radial puff (strength color.x), 2: vortex (signed strength color.x)
+void main() {
+  vec2 p = vUv - point;
+  p.x *= aspectRatio;
+  float d2 = dot(p, p);
+  float g = exp(-d2 / radius);
+  vec3 base = texture(uTarget, vUv).xyz;
+  vec3 add;
+  if (uMode > 1.5) {
+    vec2 dir = d2 > 1e-9 ? normalize(p) : vec2(0.0);
+    vec2 tang = vec2(-dir.y, dir.x);
+    tang.x /= aspectRatio;
+    add = vec3(tang * color.x, 0.0);
+  } else if (uMode > 0.5) {
+    vec2 dir = d2 > 1e-9 ? normalize(p) : vec2(0.0);
+    dir.x /= aspectRatio;
+    add = vec3(dir * color.x, 0.0);
+  } else {
+    add = color;
+  }
+  fragColor = vec4(base + g * add, 1.0);
+}`);
+
+// The classic marbling drop: every point outside the drop is pushed outward
+// along the ray from the center (Lu et al.). Implemented as an inverse warp:
+// each pixel samples its preimage; pixels inside the drop take fresh ink
+// (or clear water). Warp radii compose in quadrature, so a drop can be
+// applied as many small increments to animate the ink soaking outward.
+const dropProg = program(HEADER + `
+uniform sampler2D uDye;
+uniform vec2 point;
+uniform float radius;
+uniform float aspectRatio;
+uniform vec3 ink;     // absorbance to deposit
+uniform float uWater; // 1: clear water instead of ink
+void main() {
+  vec2 p = vUv - point;
+  p.x *= aspectRatio;
+  float d = length(p);
+  float d2 = sqrt(max(d * d - radius * radius, 0.0));
+  vec2 q = p * (d2 / max(d, 1e-6));
+  q.x /= aspectRatio;
+  vec3 outer = texture(uDye, point + q).rgb;
+  // pigment grain inside the fresh drop
+  float n = fract(sin(dot(vUv * 613.0, vec2(12.9898, 78.233))) * 43758.5453);
+  vec3 fill = uWater > 0.5 ? vec3(0.0) : ink * (0.88 + 0.24 * n);
+  float s = smoothstep(radius * 0.92, radius * 1.02, d);
+  fragColor = vec4(mix(fill, outer, s), 1.0);
+}`);
+
+const advectionProg = program(HEADER + `
+uniform sampler2D uVelocity;
+uniform sampler2D uSource;
+uniform vec2 texelSize;
+uniform float dt;
+uniform float dissipation;
+void main() {
+  vec2 coord = vUv - dt * texture(uVelocity, vUv).xy * texelSize;
+  vec4 result = texture(uSource, coord);
+  fragColor = result / (1.0 + dissipation * dt);
+}`);
+
+const divergenceProg = program(HEADER + `
+uniform sampler2D uVelocity;
+void main() {
+  float L = texture(uVelocity, vL).x;
+  float R = texture(uVelocity, vR).x;
+  float T = texture(uVelocity, vT).y;
+  float B = texture(uVelocity, vB).y;
+  vec2 C = texture(uVelocity, vUv).xy;
+  if (vL.x < 0.0) L = -C.x;
+  if (vR.x > 1.0) R = -C.x;
+  if (vT.y > 1.0) T = -C.y;
+  if (vB.y < 0.0) B = -C.y;
+  fragColor = vec4(0.5 * (R - L + T - B), 0.0, 0.0, 1.0);
+}`);
+
+const pressureProg = program(HEADER + `
+uniform sampler2D uPressure;
+uniform sampler2D uDivergence;
+void main() {
+  float L = texture(uPressure, vL).x;
+  float R = texture(uPressure, vR).x;
+  float T = texture(uPressure, vT).x;
+  float B = texture(uPressure, vB).x;
+  float divergence = texture(uDivergence, vUv).x;
+  fragColor = vec4((L + R + B + T - divergence) * 0.25, 0.0, 0.0, 1.0);
+}`);
+
+const gradientProg = program(HEADER + `
+uniform sampler2D uPressure;
+uniform sampler2D uVelocity;
+void main() {
+  float L = texture(uPressure, vL).x;
+  float R = texture(uPressure, vR).x;
+  float T = texture(uPressure, vT).x;
+  float B = texture(uPressure, vB).x;
+  vec2 velocity = texture(uVelocity, vUv).xy;
+  velocity -= vec2(R - L, T - B);
+  fragColor = vec4(velocity, 0.0, 1.0);
+}`);
+
+const curlProg = program(HEADER + `
+uniform sampler2D uVelocity;
+void main() {
+  float L = texture(uVelocity, vL).y;
+  float R = texture(uVelocity, vR).y;
+  float T = texture(uVelocity, vT).x;
+  float B = texture(uVelocity, vB).x;
+  fragColor = vec4(0.5 * (R - L - T + B), 0.0, 0.0, 1.0);
+}`);
+
+const vorticityProg = program(HEADER + `
+uniform sampler2D uVelocity;
+uniform sampler2D uCurl;
+uniform float curl;
+uniform float dt;
+void main() {
+  float L = texture(uCurl, vL).x;
+  float R = texture(uCurl, vR).x;
+  float T = texture(uCurl, vT).x;
+  float B = texture(uCurl, vB).x;
+  float C = texture(uCurl, vUv).x;
+  vec2 force = 0.5 * vec2(abs(T) - abs(B), abs(R) - abs(L));
+  force /= length(force) + 0.0001;
+  force *= curl * C;
+  force.y *= -1.0;
+  vec2 velocity = texture(uVelocity, vUv).xy;
+  velocity += force * dt;
+  fragColor = vec4(clamp(velocity, -1000.0, 1000.0), 0.0, 1.0);
+}`);
+
+const displayProg = program(HEADER + `
+uniform sampler2D uDye;
+uniform vec3 paper;
+void main() {
+  vec3 a = texture(uDye, vUv).rgb;
+  // tame faint haze; the warp gives the bleed front its definition
+  float d = dot(a, vec3(0.333));
+  a *= mix(0.5, 1.08, smoothstep(0.01, 0.3, d));
+  vec3 col = paper * exp(-a);
+  // pigment pools where density changes fast: subtle edge darkening
+  float c = dot(texture(uDye, vUv).rgb, vec3(0.333));
+  float gx = dot(texture(uDye, vR).rgb - texture(uDye, vL).rgb, vec3(0.333));
+  float gy = dot(texture(uDye, vT).rgb - texture(uDye, vB).rgb, vec3(0.333));
+  float edge = clamp(length(vec2(gx, gy)) * 2.0, 0.0, 1.0);
+  col *= 1.0 - 0.18 * edge * clamp(c, 0.0, 1.0);
+  // paper grain
+  float n = fract(sin(dot(floor(gl_FragCoord.xy * 0.75), vec2(12.9898, 78.233))) * 43758.5453);
+  col *= 0.965 + 0.035 * n;
+  fragColor = vec4(col, 1.0);
+}`);
+
+// fullscreen quad
+{
+  const buf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+}
+
+function blit(target) {
+  if (target) {
+    gl.viewport(0, 0, target.width, target.height);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, target.fbo);
+  } else {
+    gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  }
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+}
+
+function createFBO(w, h) {
+  const texture = gl.createTexture();
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, texture);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, w, h, 0, gl.RGBA, gl.HALF_FLOAT, null);
+  const fbo = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texture, 0);
+  gl.clearColor(0, 0, 0, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  return {
+    texture, fbo, width: w, height: h,
+    texelSizeX: 1 / w, texelSizeY: 1 / h,
+    attach(id) {
+      gl.activeTexture(gl.TEXTURE0 + id);
+      gl.bindTexture(gl.TEXTURE_2D, texture);
+      return id;
+    },
+  };
+}
+
+function createDoubleFBO(w, h) {
+  return {
+    width: w, height: h, texelSizeX: 1 / w, texelSizeY: 1 / h,
+    read: createFBO(w, h),
+    write: createFBO(w, h),
+    swap() { const t = this.read; this.read = this.write; this.write = t; },
+  };
+}
+
+function getResolution(resolution) {
+  let aspect = gl.drawingBufferWidth / gl.drawingBufferHeight;
+  if (aspect < 1) aspect = 1 / aspect;
+  const min = Math.round(resolution), max = Math.round(resolution * aspect);
+  return gl.drawingBufferWidth > gl.drawingBufferHeight
+    ? { width: max, height: min }
+    : { width: min, height: max };
+}
+
+// ---------- simulation state ----------
+
+const SIM_RES = 224;
+const DYE_RES = 1024;
+const PRESSURE_ITERATIONS = 22;
+const CURL = 8;
+const VELOCITY_DISSIPATION = 2.0;   // currents die out in ~2s: the paint dries
+const DYE_DISSIPATION = 0;          // pigment stains
+const SETTLE_MS = 3500;             // freeze the sim once everything has stilled
+
+let velocity, dye, divergence, curlFBO, pressure;
+
+function initFramebuffers() {
+  const sim = getResolution(SIM_RES);
+  const dyeRes = getResolution(DYE_RES);
+  velocity = createDoubleFBO(sim.width, sim.height);
+  dye = createDoubleFBO(dyeRes.width, dyeRes.height);
+  divergence = createFBO(sim.width, sim.height);
+  curlFBO = createFBO(sim.width, sim.height);
+  pressure = createDoubleFBO(sim.width, sim.height);
+}
+
+function resizeCanvas() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = Math.floor(window.innerWidth * dpr);
+  const h = Math.floor(window.innerHeight * dpr);
+  if (canvas.width !== w || canvas.height !== h) {
+    canvas.width = w;
+    canvas.height = h;
+    canvas.style.width = window.innerWidth + 'px';
+    canvas.style.height = window.innerHeight + 'px';
+    initFramebuffers();
+  }
+}
+window.addEventListener('resize', resizeCanvas);
+resizeCanvas();
+
+let lastActivity = performance.now();
+
+// mode 0: add color to dye. mode 1: radial puff. mode 2: vortex (signed strength).
+function splat(x, y, color, radius, mode) {
+  lastActivity = performance.now();
+  const target = mode ? velocity : dye;
+  gl.useProgram(splatProg.p);
+  gl.uniform2f(splatProg.u.texelSize, target.texelSizeX, target.texelSizeY);
+  gl.uniform1i(splatProg.u.uTarget, target.read.attach(0));
+  gl.uniform1f(splatProg.u.aspectRatio, canvas.width / canvas.height);
+  gl.uniform2f(splatProg.u.point, x, y);
+  gl.uniform3f(splatProg.u.color, color[0], color[1], color[2]);
+  gl.uniform1f(splatProg.u.radius, radius);
+  gl.uniform1f(splatProg.u.uMode, mode || 0);
+  blit(target.write);
+  target.swap();
+}
+
+function warpDrop(x, y, r, A, water) {
+  lastActivity = performance.now();
+  gl.useProgram(dropProg.p);
+  gl.uniform2f(dropProg.u.texelSize, dye.texelSizeX, dye.texelSizeY);
+  gl.uniform1i(dropProg.u.uDye, dye.read.attach(0));
+  gl.uniform1f(dropProg.u.aspectRatio, canvas.width / canvas.height);
+  gl.uniform2f(dropProg.u.point, x, y);
+  gl.uniform1f(dropProg.u.radius, r);
+  gl.uniform3f(dropProg.u.ink, A[0], A[1], A[2]);
+  gl.uniform1f(dropProg.u.uWater, water ? 1 : 0);
+  blit(dye.write);
+  dye.swap();
+}
+
+function splatVelocity(x, y, fx, fy, radius) {
+  lastActivity = performance.now();
+  gl.useProgram(splatProg.p);
+  gl.uniform2f(splatProg.u.texelSize, velocity.texelSizeX, velocity.texelSizeY);
+  gl.uniform1i(splatProg.u.uTarget, velocity.read.attach(0));
+  gl.uniform1f(splatProg.u.aspectRatio, canvas.width / canvas.height);
+  gl.uniform2f(splatProg.u.point, x, y);
+  gl.uniform3f(splatProg.u.color, fx, fy, 0);
+  gl.uniform1f(splatProg.u.radius, radius);
+  gl.uniform1f(splatProg.u.uMode, 0);
+  blit(velocity.write);
+  velocity.swap();
+}
+
+function step(dt) {
+  gl.disable(gl.BLEND);
+
+  gl.useProgram(curlProg.p);
+  gl.uniform2f(curlProg.u.texelSize, velocity.texelSizeX, velocity.texelSizeY);
+  gl.uniform1i(curlProg.u.uVelocity, velocity.read.attach(0));
+  blit(curlFBO);
+
+  gl.useProgram(vorticityProg.p);
+  gl.uniform2f(vorticityProg.u.texelSize, velocity.texelSizeX, velocity.texelSizeY);
+  gl.uniform1i(vorticityProg.u.uVelocity, velocity.read.attach(0));
+  gl.uniform1i(vorticityProg.u.uCurl, curlFBO.attach(1));
+  gl.uniform1f(vorticityProg.u.curl, CURL);
+  gl.uniform1f(vorticityProg.u.dt, dt);
+  blit(velocity.write);
+  velocity.swap();
+
+  gl.useProgram(divergenceProg.p);
+  gl.uniform2f(divergenceProg.u.texelSize, velocity.texelSizeX, velocity.texelSizeY);
+  gl.uniform1i(divergenceProg.u.uVelocity, velocity.read.attach(0));
+  blit(divergence);
+
+  gl.useProgram(pressureProg.p);
+  gl.uniform2f(pressureProg.u.texelSize, velocity.texelSizeX, velocity.texelSizeY);
+  gl.uniform1i(pressureProg.u.uDivergence, divergence.attach(0));
+  for (let i = 0; i < PRESSURE_ITERATIONS; i++) {
+    gl.uniform1i(pressureProg.u.uPressure, pressure.read.attach(1));
+    blit(pressure.write);
+    pressure.swap();
+  }
+
+  gl.useProgram(gradientProg.p);
+  gl.uniform2f(gradientProg.u.texelSize, velocity.texelSizeX, velocity.texelSizeY);
+  gl.uniform1i(gradientProg.u.uPressure, pressure.read.attach(0));
+  gl.uniform1i(gradientProg.u.uVelocity, velocity.read.attach(1));
+  blit(velocity.write);
+  velocity.swap();
+
+  gl.useProgram(advectionProg.p);
+  gl.uniform2f(advectionProg.u.texelSize, velocity.texelSizeX, velocity.texelSizeY);
+  gl.uniform1i(advectionProg.u.uVelocity, velocity.read.attach(0));
+  gl.uniform1i(advectionProg.u.uSource, velocity.read.attach(0));
+  gl.uniform1f(advectionProg.u.dt, dt);
+  gl.uniform1f(advectionProg.u.dissipation, VELOCITY_DISSIPATION);
+  blit(velocity.write);
+  velocity.swap();
+
+  gl.uniform1i(advectionProg.u.uVelocity, velocity.read.attach(0));
+  gl.uniform1i(advectionProg.u.uSource, dye.read.attach(1));
+  gl.uniform1f(advectionProg.u.dissipation, DYE_DISSIPATION);
+  blit(dye.write);
+  dye.swap();
+}
+
+function render() {
+  gl.useProgram(displayProg.p);
+  gl.uniform2f(displayProg.u.texelSize, dye.texelSizeX, dye.texelSizeY);
+  gl.uniform1i(displayProg.u.uDye, dye.read.attach(0));
+  gl.uniform3f(displayProg.u.paper, PAPER_RGB[0], PAPER_RGB[1], PAPER_RGB[2]);
+  blit(null);
+}
+
+// ---------- ink blooms: a keystroke soaks in over ~a second ----------
+
+// absorbance per channel (Beer-Lambert): dye accumulates -ln(color)
+function absorbance(hex, strength) {
+  const r = parseInt(hex.slice(1, 3), 16) / 255;
+  const g = parseInt(hex.slice(3, 5), 16) / 255;
+  const b = parseInt(hex.slice(5, 7), 16) / 255;
+  return [
+    -Math.log(Math.max(r, 0.03)) * strength,
+    -Math.log(Math.max(g, 0.03)) * strength,
+    -Math.log(Math.max(b, 0.03)) * strength,
+  ];
+}
+
+const blooms = [];
+function easeOutCubic(t) { return 1 - Math.pow(1 - t, 3); }
+
+// R: final drop radius in uv units. The drop soaks in over `dur` ms via
+// incremental warps; `delay` lets ink / water / core rings cascade.
+function addBloom(x, y, R, color, strength, dur, opts = {}) {
+  if (blooms.length > 40) blooms.shift();
+  blooms.push({
+    x, y, R,
+    water: !!opts.water,
+    A: opts.water ? [0, 0, 0] : absorbance(color, strength),
+    t0: performance.now() + (opts.delay || 0), dur,
+    applied: 0, pending: 0,
+  });
+}
+
+function stepBlooms(now) {
+  for (let i = blooms.length - 1; i >= 0; i--) {
+    const b = blooms[i];
+    if (now < b.t0) continue;
+    const t = Math.min(1, (now - b.t0) / b.dur);
+    const e = easeOutCubic(t);
+    b.pending += e - b.applied;
+    b.applied = e;
+    // warp radii compose in quadrature; batch tiny increments up
+    const r = b.R * Math.sqrt(b.pending);
+    if (r > 0.0015 || (t >= 1 && b.pending > 0)) {
+      warpDrop(b.x, b.y, r, b.A, b.water);
+      b.pending = 0;
+    }
+    if (t >= 1) blooms.splice(i, 1);
+  }
+}
+
+// ---------- signature: keystrokes -> ink ----------
+
+const PALETTE = [
+  ['#23242b', 6],    // sumi black
+  ['#2b4a7f', 2],    // indigo
+  ['#b2422a', 1.5],  // vermilion
+  ['#46604c', 1],    // pine
+  ['#bf9540', 0.5],  // muted gold
+];
+const PALETTE_TOTAL = PALETTE.reduce((s, c) => s + c[1], 0);
+
+function hash32(n) {
+  n = Math.imul(n ^ (n >>> 16), 2654435761);
+  n = Math.imul(n ^ (n >>> 13), 1597334677);
+  return (n ^ (n >>> 16)) >>> 0;
+}
+
+function colorFor(code, index) {
+  let r = (hash32(code * 31 + index * 7) % 1000) / 1000 * PALETTE_TOTAL;
+  for (const [c, w] of PALETTE) {
+    r -= w;
+    if (r <= 0) return c;
+  }
+  return PALETTE[0][0];
+}
+
+// pen position in uv coordinates (y up)
+const pen = { x: 0, y: 0 };
+let typed = '';
+let lastKeyTime = 0;
+let strokes = []; // {x, y, adv} per keystroke, for backspace
+
+function resetPen() {
+  pen.x = 0.18;
+  pen.y = 0.54;
+}
+resetPen();
+
+const nameEl = document.getElementById('name');
+const hintEl = document.getElementById('hint');
+
+function inkKeystroke(ch) {
+  const now = performance.now();
+  const dt = lastKeyTime ? Math.min(now - lastKeyTime, 1500) : 400;
+  lastKeyTime = now;
+
+  const code = ch.charCodeAt(0);
+  const h = hash32(code * 2654435761 + typed.length);
+
+  // pause before a key = more ink in the brush; vowels bloom a little more
+  let R = 0.038 + dt * 0.000024;
+  if ('aeiou'.includes(ch.toLowerCase())) R += 0.006;
+  R = Math.min(R, 0.082);
+
+  const jitter = ((h % 25) - 12) / 12; // -1..1
+  const x = pen.x, y = pen.y - jitter * 0.025;
+  const color = colorFor(code, typed.length);
+  const isUpper = ch !== ch.toLowerCase() && ch === ch.toUpperCase();
+
+  const dur = 800 + R * 20000;
+  addBloom(x, y, R, color, isUpper ? 2.4 : 1.9, dur);
+  if (isUpper) {
+    // suminagashi pumping: clear water opens a ring, fresh ink refills the eye
+    addBloom(x, y, R * 0.58, null, 0, dur * 0.7, { water: true, delay: dur });
+    addBloom(x, y, R * 0.3, color, 2.2, dur * 0.6, { delay: dur * 1.7 });
+  } else if (h % 10 < 6) {
+    addBloom(x, y, R * 0.48, null, 0, dur * 0.6, { water: true, delay: dur * 0.9 });
+  }
+
+  const adv = Math.max(R * 1.35, 0.042);
+  strokes.push({ x, y, adv });
+  pen.x += adv;
+  if (pen.x > 0.85) {
+    pen.x = 0.2;
+    pen.y -= 0.17;
+    if (pen.y < 0.2) pen.y = 0.6;
+  }
+}
+
+function handleKey(key) {
+  if (key.length === 1) {
+    if (key === ' ') {
+      // a space is a gentle current, not a drop
+      splatVelocity(pen.x, pen.y, 240, 30, 0.002);
+      strokes.push({ x: pen.x, y: pen.y, adv: 0.028 });
+      pen.x += 0.028;
+    } else {
+      inkKeystroke(key);
+    }
+    typed += key;
+    nameEl.textContent = typed;
+    hintEl.classList.add('hidden');
+    return true;
+  }
+  if (key === 'Backspace') {
+    if (typed.length) {
+      typed = typed.slice(0, -1);
+      nameEl.textContent = typed;
+      const s = strokes.pop();
+      if (s) {
+        // a drop of clear water shoves the pigment back out
+        addBloom(s.x, s.y, 0.05, null, 0, 550, { water: true });
+        pen.x -= s.adv;
+      }
+    }
+    return true;
+  }
+  if (key === 'Enter') {
+    // flourish: a sweeping current under the whole signature
+    for (let i = 0; i <= 8; i++) {
+      const x = i / 8;
+      splatVelocity(x, pen.y + Math.sin(i * 1.4) * 0.04, 950, Math.cos(i * 1.1) * 220, 0.004);
+    }
+    return true;
+  }
+  return false;
+}
+
+let lastDesktopKey = 0;
+window.addEventListener('keydown', (e) => {
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  if (handleKey(e.key)) {
+    e.preventDefault();
+    lastDesktopKey = performance.now();
+  }
+});
+
+// mobile keyboards: hidden input summons the keyboard; dedupe against keydown
+const kb = document.getElementById('kb');
+kb.addEventListener('beforeinput', (e) => {
+  e.preventDefault();
+  if (performance.now() - lastDesktopKey < 120) return;
+  if (e.inputType === 'insertText' && e.data) {
+    for (const ch of e.data) handleKey(ch);
+  } else if (e.inputType === 'deleteContentBackward') {
+    handleKey('Backspace');
+  }
+});
+
+// ---------- pointer: click drops ink, drag stirs ----------
+
+function toUv(e) {
+  return { x: e.clientX / window.innerWidth, y: 1 - e.clientY / window.innerHeight };
+}
+
+let pointer = null;
+canvas.addEventListener('pointerdown', (e) => {
+  try { canvas.setPointerCapture(e.pointerId); } catch (_) {}
+  const p = toUv(e);
+  pointer = { x: p.x, y: p.y, moved: 0 };
+  kb.focus({ preventScroll: true }); // summon keyboard on touch devices
+});
+canvas.addEventListener('pointermove', (e) => {
+  if (!pointer) return;
+  const p = toUv(e);
+  const dx = p.x - pointer.x, dy = p.y - pointer.y;
+  const dist = Math.hypot(dx, dy);
+  if (dist < 0.002) return;
+  pointer.moved += dist;
+  splatVelocity(p.x, p.y, dx * 9000, dy * 9000, 0.0014);
+  pointer.x = p.x;
+  pointer.y = p.y;
+});
+canvas.addEventListener('pointerup', (e) => {
+  if (pointer && pointer.moved < 0.005) {
+    const p = toUv(e);
+    const h = hash32((e.clientX * 73856093) ^ (e.clientY * 19349663));
+    const R = 0.032 + (h % 100) / 100 * 0.034;
+    const dur = 800 + R * 20000;
+    addBloom(p.x, p.y, R, colorFor(h % 128, h % 97), 2.0, dur);
+    if (h % 3 !== 0)
+      addBloom(p.x, p.y, R * 0.5, null, 0, dur * 0.6, { water: true, delay: dur * 0.9 });
+  }
+  pointer = null;
+});
+
+// ---------- controls ----------
+
+document.getElementById('clearBtn').addEventListener('click', () => {
+  blooms.length = 0;
+  strokes = [];
+  typed = '';
+  lastKeyTime = 0;
+  nameEl.textContent = '';
+  hintEl.classList.remove('hidden');
+  resetPen();
+  for (const fbo of [velocity.read, velocity.write, dye.read, dye.write, pressure.read, pressure.write]) {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo.fbo);
+    gl.clearColor(0, 0, 0, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+  }
+});
+
+document.getElementById('saveBtn').addEventListener('click', () => {
+  const a = document.createElement('a');
+  a.download = (typed.trim().replace(/\s+/g, '-').toLowerCase() || 'ink') + '-signature.png';
+  a.href = canvas.toDataURL('image/png');
+  a.click();
+});
+
+// ---------- main loop ----------
+
+let lastFrame = performance.now();
+function frameBody(now) {
+  const dt = Math.min((now - lastFrame) / 1000, 0.0166);
+  lastFrame = now;
+  stepBlooms(now);
+  // watercolor has a terminal point: once the currents have died and no ink
+  // is soaking in, the painting dries and the sim freezes
+  if (now - lastActivity < SETTLE_MS) step(dt);
+  render();
+}
+function frame(now) {
+  frameBody(now);
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+// rAF pauses in hidden tabs; keep the ink soaking in the background
+setInterval(() => {
+  if (document.hidden) frameBody(performance.now());
+}, 33);
+</script>
+</body>
+</html>
